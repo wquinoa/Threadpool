@@ -4,7 +4,6 @@
 # include <unistd.h>
 # include <iostream>
 # include <vector>
-# include <time.h>
 # include <queue>
 
 
@@ -18,101 +17,173 @@ class Threadpool
 
  # define MAX_WORK 32
  # define MAX_Q 8192
- # define VALIDATE_CARGS(x, y) (x > 0 || y > 0 || x <= MAX_WORK || y <= MAX_Q)
+ # define VALID_PARAMS(x, y) (x > 0 && y > 0 && x <= MAX_WORK && y <= MAX_Q)
  
-    std::vector<pthread_t >     threads;
+    std::vector<pthread_t>      threads;
     pthread_mutex_t             innerLock;
     std::queue<T *>             q;
-    size_t                      qLen;
+    size_t                      nWorkers, qSize;
     
-    int flags;
+    int status;
+
+    enum e_pool_status
+    {
+        pool_ok = 0,
+        pool_pause = (1 << 0),
+        pool_stop = (1 << 1),
+        pool_kill = (1 << 2)
+    };
+
+    class pool_strerror : public std::exception {
+      public:
+        char const *what() const throw() {
+            std::string error(strerror(errno)); 
+
+            error += " errno: " + std::to_string(errno);
+            return (error.c_str());
+        }
+    };
 
     static void    *workerLoop(void* arg)
     {
         Threadpool<T> *pool = (Threadpool<T> *)arg;
         T *task;
         
-        /* Waiting for a task in queue or a signal */
         while (true)
         {
+
+            while (pool->state() == pool_pause)
+                usleep (20000);
+
+            usleep(200);
+
+            /* Waiting for a task in queue or a signal */
 
             if ((task = pool->getTask()))
                 pool->job(task);
 
-            if (pool->status())
+            if (pool->state())
                 break ;
             
-            usleep(200);
         }
+        usleep(20000);
         return (nullptr);
     }
 
-    enum e_pool_flag
-    {
-        pool_ok,
-        pool_stop,
-        pool_kill
+    int const &state() const { return status; }
+
+    /* Cannot copy or assign a Threadpool */
+
+    Threadpool &operator=(const Threadpool &copy) { 
+        (void)copy; return (*this); 
     };
+
+    Threadpool(const Threadpool &copy) {
+        (void)copy;
+    };
+
+    /* pthread wrappers */
+
+    void lock() {
+        if (pthread_mutex_lock(&innerLock))
+            throw pool_strerror();
+    }
+
+    void unlock() {
+        if (pthread_mutex_unlock(&innerLock))
+            throw pool_strerror();
+    }
+
+    void createThreads() {
+        pthread_t newThread;
+
+        status = pool_pause;
+        for (size_t i = 0; i < nWorkers; ++i)
+        {
+            if (pthread_create(&newThread, nullptr, &workerLoop, this) < 0)
+                throw pool_strerror();
+            threads.push_back(newThread);
+        }
+    }
+
+    void gracefulShutdown() {
+        status = pool_stop;
+
+        for (size_t i = 0; i < nWorkers; ++i)
+        {
+            if (pthread_join(threads[i], nullptr) < 0)
+                throw pool_strerror();
+        }
+    }
 
  public:
 
+    /* Constructor */
+
     Threadpool(int workers, int queue_size)
-    : threads(workers), qLen(queue_size), flags(pool_ok)
+    : nWorkers(workers), qSize(queue_size), status(pool_ok)
     {
-        if (!VALIDATE_CARGS(workers, queue_size))
-            throw (std::runtime_error("Invalid constructor arguments"));
+
+        if (VALID_PARAMS(workers, queue_size) == false)
+            throw (std::runtime_error("Threadpool: invalid constructor arguments"));
 
         if (pthread_mutex_init(&innerLock, nullptr) < 0)
-            throw (std::runtime_error("Mutex init failed"));
+            throw pool_strerror();
 
-        pthread_mutex_lock(&innerLock);
-        for (size_t i = 0; i < threads.size(); ++i)
-        {
-            if (pthread_create(&threads[i], nullptr, &workerLoop, this) < 0)
-                throw (std::runtime_error("Thread creation failed"));
-        }
-        pthread_mutex_unlock(&innerLock);
+        createThreads();
     }
+
+    /* Destructor */
 
     virtual ~Threadpool()
     {
-        flags = pool_stop;
+        gracefulShutdown();
 
-        for (size_t i = 0; i < threads.size(); ++i)
-        {
-            if (pthread_join(threads[i], nullptr) < 0)
-                throw (std::runtime_error("Pthread join failed"));
-
-        }
-        pthread_mutex_destroy(&innerLock);
+        if (pthread_mutex_destroy(&innerLock))
+            throw pool_strerror();
     }
 
-    void addTask(T *value)
+    /* Member functions */
+
+    bool addTask(T *value)
     {
-        pthread_mutex_lock(&innerLock);
-        q.push(value);
-        pthread_mutex_unlock(&innerLock);
+        bool ret;
+
+        lock();
+        if (q.size() == qSize)
+            ret = false;
+        else
+        {
+            q.push(value);
+            ret = true;
+        }
+        unlock();
+        return ret;
     }
 
     T *getTask() 
     {
         T *ret;
 
-        pthread_mutex_lock(&innerLock);
-        if (q.empty())
+        lock();
+        if (q.empty() || status != pool_ok)
             ret = nullptr;
-        else
+        else 
         {
             ret = q.front();
             q.pop();
         }
-        pthread_mutex_unlock(&innerLock);
+        unlock();
         return ret;
     }
 
-    int const &status() const { return flags; }
+    /* "Signals" */
 
-    void kill() { flags = pool_kill; }
+    void kill() { status = pool_kill; }
+
+    void pause() { status = pool_pause; }
+
+    void start() { status = pool_ok; }
 
     /* Derive from Threadpool to create the needed job */
 

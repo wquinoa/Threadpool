@@ -1,11 +1,14 @@
 CXX := clang++
-CXXFLAGS := -Wall -Werror -Wextra -std=c++98
+CXXFLAGS := -Wall -Werror -Wextra -std=c++98 -MMD
 
 NAME := test.out
-SRC := main.cpp
+SRC := test.cpp
 OBJ := $(SRC:.cpp=.o)
+DEP := $(SRC:.cpp=.d)
 
 .PHONY: all clean fclean re run
+
+-include $(DEP)
 
 all: $(NAME)
 
@@ -16,7 +19,7 @@ run: $(NAME)
 	./$<
 
 clean:
-	rm -rf $(OBJ)
+	rm -rf $(OBJ) $(DEP)
 
 fclean: clean
 	rm -rf $(NAME)
